@@ -1,0 +1,17 @@
+# This file tells Render how to build and deploy your Node.js API
+services:
+  - type: web
+    name: funko-memory-game-api
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    # The root directory is now the root of this new repository
+    rootDir: ./
+    # Environment variables for your service
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false # This will be set manually in Render UI for security
+      - key: PORT
+        value: 3002 # Render will override this with its own port, but it's good practice to define
