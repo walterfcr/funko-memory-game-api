@@ -15,7 +15,12 @@ const PORT = process.env.PORT || 3002
 connectDB()
 
 // Middleware
-app.use(cors()) // Allow cross-origin requests from your React app
+app.use(cors({
+  origin: ["https://your-frontend-domain.vercel.app"], // your actual frontend URL here
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  credentials: true,
+}));
+
 app.use(express.json()) // Parse JSON request bodies
 app.use(express.urlencoded({ extended: true })) // Parse URL-encoded bodies
 
