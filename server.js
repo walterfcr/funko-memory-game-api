@@ -16,7 +16,7 @@ connectDB()
 
 // Middleware
 app.use(cors({
-  origin: ["https://your-frontend-domain.vercel.app"], // your actual frontend URL here
+  origin: ["https://memory-game-react-cyan.vercel.app/"], // your actual frontend URL here
   methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: true,
 }));
