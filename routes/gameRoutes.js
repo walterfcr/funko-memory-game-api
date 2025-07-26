@@ -1,9 +1,14 @@
 import express from "express"
 import Score from "../models/Score.js"
+import { protect } from "../middleware/authMiddleware.js"
 
 const router = express.Router()
 
-// Game categories and difficulties (keep these for validation)
+// Cache for static data (in production, use Redis)
+let categoriesCache = null
+let difficultiesCache = null
+
+// Game categories and difficulties
 const gameCategories = [
   { id: "heroes", name: "Heroes", description: "Superhero Funko Pops" },
   { id: "movies", name: "Movies", description: "Movie character Funko Pops" },
@@ -17,15 +22,21 @@ const gameDifficulties = [
   { id: "hard", name: "Hard", description: "For experts" },
 ]
 
-// GET /api/categories - Get all categories
+// GET /api/categories - Get all categories (cached)
 router.get("/categories", (req, res) => {
   try {
-    res.json({
-      success: true,
-      data: gameCategories,
-      count: gameCategories.length,
-      message: "Game categories retrieved successfully",
-    })
+    if (!categoriesCache) {
+      categoriesCache = {
+        success: true,
+        data: gameCategories,
+        count: gameCategories.length,
+        message: "Game categories retrieved successfully",
+        cached: true,
+      }
+    }
+
+    res.set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
+    res.json(categoriesCache)
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -34,15 +45,21 @@ router.get("/categories", (req, res) => {
   }
 })
 
-// GET /api/difficulties - Get all difficulties
+// GET /api/difficulties - Get all difficulties (cached)
 router.get("/difficulties", (req, res) => {
   try {
-    res.json({
-      success: true,
-      data: gameDifficulties,
-      count: gameDifficulties.length,
-      message: "Difficulty levels retrieved successfully",
-    })
+    if (!difficultiesCache) {
+      difficultiesCache = {
+        success: true,
+        data: gameDifficulties,
+        count: gameDifficulties.length,
+        message: "Difficulty levels retrieved successfully",
+        cached: true,
+      }
+    }
+
+    res.set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
+    res.json(difficultiesCache)
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -51,10 +68,12 @@ router.get("/difficulties", (req, res) => {
   }
 })
 
-// GET /api/scores - Get all scores from MongoDB
+// GET /api/scores - Get all scores from MongoDB (with caching)
 router.get("/scores", async (req, res) => {
   try {
-    const { category, difficulty, limit = 50 } = req.query
+    const { category, difficulty, limit = 50, page = 1 } = req.query
+    const limitNum = Math.min(Number.parseInt(limit), 100) // Max 100 results
+    const skip = (Number.parseInt(page) - 1) * limitNum
 
     // Build filter object
     const filter = {}
@@ -65,13 +84,18 @@ router.get("/scores", async (req, res) => {
       filter.difficulty = difficulty
     }
 
-    // Get scores from MongoDB
+    // Get scores from MongoDB with optimized query
     const scores = await Score.find(filter)
-      .sort({ time: 1, moves: 1 }) // Sort by time (fastest first), then moves
-      .limit(Number.parseInt(limit))
-      .lean() // Returns plain JavaScript objects
+      .sort({ time: 1, moves: 1 }) // Use indexed fields for sorting
+      .limit(limitNum)
+      .skip(skip)
+      .lean() // Returns plain JavaScript objects (faster)
+      .select("playerName category difficulty time moves date createdAt") // Only select needed fields
 
-    // Format the response to match your existing API
+    // Get total count for pagination
+    const totalCount = await Score.countDocuments(filter)
+
+    // Format the response
     const formattedScores = scores.map((score) => ({
       id: score._id,
       playerName: score.playerName,
@@ -79,37 +103,123 @@ router.get("/scores", async (req, res) => {
       difficulty: score.difficulty,
       time: score.time,
       moves: score.moves,
-      date: score.date.toISOString().split("T")[0], // Format as YYYY-MM-DD
+      date: score.date.toISOString().split("T")[0],
     }))
+
+    // Set cache headers
+    res.set("Cache-Control", "public, max-age=300") // Cache for 5 minutes
 
     res.json({
       success: true,
       data: formattedScores,
       count: formattedScores.length,
+      totalCount,
+      page: Number.parseInt(page),
+      totalPages: Math.ceil(totalCount / limitNum),
       message: `Scores retrieved from MongoDB successfully`,
-      filters: { category, difficulty, limit },
+      filters: { category, difficulty, limit: limitNum },
     })
   } catch (error) {
     console.error("Error fetching scores:", error)
     res.status(500).json({
       success: false,
       error: "Failed to fetch scores from database",
+      details: process.env.NODE_ENV === "development" ? error.message : undefined,
+    })
+  }
+})
+
+// NEW ROUTE: GET /api/scores/me - Get scores for the authenticated user
+router.get("/scores/me", protect, async (req, res) => {
+  try {
+    const userId = req.user._id // Get userId from the authenticated user
+    const { category, difficulty, limit = 50, page = 1 } = req.query
+    const limitNum = Math.min(Number.parseInt(limit), 100)
+    const skip = (Number.parseInt(page) - 1) * limitNum
+
+    const filter = { userId: userId } // Filter by the authenticated user's ID
+    if (category && category !== "all") {
+      filter.category = category
+    }
+    if (difficulty && difficulty !== "all") {
+      filter.difficulty = difficulty
+    }
+
+    const scores = await Score.find(filter)
+      .sort({ time: 1, moves: 1 })
+      .limit(limitNum)
+      .skip(skip)
+      .lean()
+      .select("playerName category difficulty time moves date createdAt")
+
+    const totalCount = await Score.countDocuments(filter)
+
+    const formattedScores = scores.map((score) => ({
+      id: score._id,
+      playerName: score.playerName,
+      category: score.category,
+      difficulty: score.difficulty,
+      time: score.time,
+      moves: score.moves,
+      date: score.date.toISOString().split("T")[0],
+    }))
+
+    res.set("Cache-Control", "private, max-age=60") // Cache for 1 minute (user-specific)
+
+    res.json({
+      success: true,
+      data: formattedScores,
+      count: formattedScores.length,
+      totalCount,
+      page: Number.parseInt(page),
+      totalPages: Math.ceil(totalCount / limitNum),
+      message: `User-specific scores retrieved successfully`,
+      filters: { category, difficulty, limit: limitNum, userId: userId },
+    })
+  } catch (error) {
+    console.error("Error fetching user scores:", error)
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch user scores from database",
+      details: process.env.NODE_ENV === "development" ? error.message : undefined,
     })
   }
 })
 
 // POST /api/scores - Submit a new game score to MongoDB
-router.post("/scores", async (req, res) => {
+router.post("/scores", protect, async (req, res) => {
   try {
     const { playerName, category, difficulty, time, moves } = req.body
 
-    console.log("📝 RECEIVED SCORE DATA:", req.body)
+    // Get userId from the authenticated user (set by 'protect' middleware)
+    const userId = req.user._id
+
+    if (process.env.NODE_ENV === "development") {
+      console.log("📝 POST /api/scores - RECEIVED SCORE DATA:", req.body)
+    }
 
     // Basic validation
     if (!playerName || !category || !difficulty || time === undefined || moves === undefined) {
       return res.status(400).json({
         success: false,
         error: "Missing required fields: playerName, category, difficulty, time, moves",
+      })
+    }
+
+    // Validate ranges
+    if (time < 1 || time > 3600) {
+      // 1 second to 1 hour
+      return res.status(400).json({
+        success: false,
+        error: "Invalid time value",
+      })
+    }
+
+    if (moves < 1 || moves > 1000) {
+      // Reasonable move limit
+      return res.status(400).json({
+        success: false,
+        error: "Invalid moves value",
       })
     }
 
@@ -131,19 +241,21 @@ router.post("/scores", async (req, res) => {
       })
     }
 
-    // Check for recent duplicate (same player, category, difficulty within last 10 seconds)
+    // Check for recent duplicate (optimized query)
     const tenSecondsAgo = new Date(Date.now() - 10000)
     const recentDuplicate = await Score.findOne({
-      playerName: { $regex: new RegExp(`^${playerName}$`, "i") }, // Case insensitive
+      playerName: { $regex: new RegExp(`^${playerName.trim()}$`, "i") },
       category,
       difficulty,
       createdAt: { $gte: tenSecondsAgo },
-      time: { $gte: Number.parseInt(time) - 5, $lte: Number.parseInt(time) + 5 }, // Within 5 seconds
-      moves: { $gte: Number.parseInt(moves) - 2, $lte: Number.parseInt(moves) + 2 }, // Within 2 moves
-    })
+      time: { $gte: Number.parseInt(time) - 5, $lte: Number.parseInt(time) + 5 },
+      moves: { $gte: Number.parseInt(moves) - 2, $lte: Number.parseInt(moves) + 2 },
+    }).lean()
 
     if (recentDuplicate) {
-      console.log("🚫 DUPLICATE DETECTED - Rejecting similar score")
+      if (process.env.NODE_ENV === "development") {
+        console.log("🚫 DUPLICATE DETECTED - Rejecting similar score")
+      }
       return res.status(409).json({
         success: false,
         error: "Duplicate score detected",
@@ -157,6 +269,7 @@ router.post("/scores", async (req, res) => {
     // Create new score in MongoDB
     const newScore = new Score({
       playerName: playerName.trim(),
+      userId: userId,
       category,
       difficulty,
       time: Number.parseInt(time),
@@ -166,13 +279,16 @@ router.post("/scores", async (req, res) => {
 
     const savedScore = await newScore.save()
 
-    console.log("✅ SCORE SAVED TO MONGODB:", savedScore._id)
+    if (process.env.NODE_ENV === "development") {
+      console.log("✅ SCORE SAVED TO MONGODB:", savedScore._id)
+    }
 
     res.status(201).json({
       success: true,
       data: {
         id: savedScore._id,
         playerName: savedScore.playerName,
+        userId: savedScore.userId,
         category: savedScore.category,
         difficulty: savedScore.difficulty,
         time: savedScore.time,
@@ -187,8 +303,77 @@ router.post("/scores", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to submit score to database",
+      details: process.env.NODE_ENV === "development" ? error.message : undefined,
     })
   }
 })
+
+// GET /api/stats - Get game statistics (cached)
+router.get("/stats", async (req, res) => {
+  try {
+    const stats = await Promise.all([
+      Score.countDocuments(),
+      Score.distinct("playerName").then((players) => players.length),
+      Score.findOne().sort({ time: 1 }).lean(),
+      Score.aggregate([{ $group: { _id: "$category", count: { $sum: 1 } } }]),
+    ])
+
+    const [totalGames, totalPlayers, bestScore, categoryStats] = stats
+
+    res.set("Cache-Control", "public, max-age=600") // Cache for 10 minutes
+
+    res.json({
+      success: true,
+      data: {
+        totalGames,
+        totalPlayers,
+        bestScore: bestScore
+          ? {
+              playerName: bestScore.playerName,
+              time: bestScore.time,
+              category: bestScore.category,
+              difficulty: bestScore.difficulty,
+            }
+          : null,
+        categoryStats: categoryStats.reduce((acc, stat) => {
+          acc[stat._id] = stat.count
+          return acc
+        }, {}),
+      },
+      message: "Game statistics retrieved successfully",
+    })
+  } catch (error) {
+    console.error("Error fetching stats:", error)
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch game statistics",
+    })
+  }
+})
+
+// DEBUG ROUTE - Only in development
+if (process.env.NODE_ENV === "development") {
+  router.get("/debug/stats", async (req, res) => {
+    try {
+      const totalScores = await Score.countDocuments()
+      const sampleScores = await Score.find().limit(3).lean()
+
+      res.json({
+        success: true,
+        stats: {
+          totalScores,
+          sampleScores,
+          databaseName: Score.db.name,
+          collectionName: Score.collection.name,
+        },
+      })
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        error: error.message,
+      })
+    }
+  })
+}
 
 export default router
